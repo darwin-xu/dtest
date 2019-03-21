@@ -1,6 +1,302 @@
-test1
-line 1
-line 2
-line 3
-line 4
-line5-2:line 5-1
+LW_NTSTATUS
+LwRtlThreadCreate(
+    LW_IN LW_THREAD_FUNCTION Function,
+    LW_IN LW_PVOID pContext,
+    LW_IN PLW_THREAD_ATTR pAttr,
+    LW_OUT PLW_THREAD* ppThread
+    )
+
+typedef LW_THREAD* PLW_THREAD;
+
+typedef struct _LW_THREAD LW_THREAD;
+
+struct _LW_THREAD
+{
+    LW_THREAD_FUNCTION Function;
+    PVOID pContext;
+    LW_THREAD_FLAGS Flags;
+    LONG State;
+    pthread_t Pthread;
+    // System thread ID (debugging aid on FreeBSD)
+    pid_t ThreadId;
+    LW_MUTEX WaitMutex;
+    LW_COND WaitCond;
+    LW_COND SleepCond;
+    BOOL volatile Woken;
+    // Entry in global list of threads
+    // List head is allLwThreads
+    LW_LIST_ENTRY AllEntry;
+    // Main fiber (the original context and stack from pthreads)
+    LW_FIBER MainFiber;
+    // Currently running fiber
+    PLW_FIBER pCurrentFiber;
+    // Count of resources (e.g. locks) held by thread
+    LONG ResCount;
+};
+
+typedef struct _LW_FIBER
+{
+    // Reference count
+    LONG RefCount;
+    // Entry in list of all fibers in process
+    // List head is allFibers
+    LW_LIST_ENTRY AllEntry;
+    // Thread that last ran us
+    PLW_THREAD pThread;
+    // Fiber to switch to when start function returns
+    PLW_FIBER pReturnFiber;
+    // Scheduler in charge of this fiber
+    PLW_FIBER_SCHEDULER Scheduler;
+    // Data for scheduler's use
+    PVOID pSchedulerData;
+    // Saved CPU state for suspended fiber
+    MACHINE_CONTEXT MachineContext;
+    // Size of stack
+    ULONG StackSize;
+    // Fiber ID (debugging aid, no semantic importance)
+    LONG Id;
+#ifdef HAVE_VALGRIND_VALGRIND_H
+    // Valgrind stack ID from valgrind API
+    unsigned int ValgrindId;
+#endif
+#ifdef LW_FIBER_CXX
+    // Saved exception handler information
+    __cxa_eh_globals EhInfo;
+#endif
+    // Hidden fiber (debugging aid, no semantic importance)
+    BOOLEAN Hidden;
+    // Pointer to base (low address) of stack
+    PBYTE pStackBase;
+    // Pointer to fiber-local storage record
+    PLW_FLS_RECORD Fls;
+} LW_FIBER;
+
+typedef struct _LW_LIST_ENTRY {
+    /** @brief Next entry */
+    struct _LW_LIST_ENTRY* Next;
+    /** @brief Previous entry */
+    struct _LW_LIST_ENTRY* Prev;
+} LW_LIST_ENTRY, *PLW_LIST_ENTRY;
+
+
+struct _LW_TASK
+{
+    // Fields that are immutable once set
+    struct
+    {
+        // Owning event loop
+        PEVENT_LOOP EventLoop;
+        // Owning group
+        PLW_TASK_GROUP Group;
+        // Callback function and context
+        LW_TASK_FUNCTION Func;
+        PVOID FuncContext; <===================================== param
+
+    } LW_CACHE_ALIGNED;
+    // Fields owned by task (stays with thread that blocks when loop moves)
+    struct
+    {
+        // Events task is waiting for
+        LW_TASK_EVENT_MASK EventWait;
+        // New timeout
+        LONG64 NewTimeout;
+    } LW_CACHE_ALIGNED;
+    // Fields owned by event loop (ownership moves with loop)
+    struct
+    {
+        // Backend-specific fields
+        TASK_SPECIFIC Backend;
+        // Link to siblings in scheduler queue
+        RING QueueRing;
+        // Entry in timed heap
+        LW_PAIR_NODE TimedNode;
+        // Absolute time of next timer event (according to EventLoop->Clock)
+        LONG64 Deadline;
+        // Last set of events task waited for
+        LW_TASK_EVENT_MASK EventLastWait;
+        // Events that will be passed to task function
+        LW_TASK_EVENT_MASK EventArgs;
+        // File descriptor for fd-based events
+        int Fd;
+        // Is event delivery paused while task blocks a thread?
+        BOOLEAN IsPaused;
+        // Is task complete (returned from function with no wait mask)?
+        BOOLEAN IsComplete;
+    } LW_CACHE_ALIGNED;
+
+    // Atomic and shared fields
+    struct
+    {
+        // Link to siblings in task group (headed by Group->Tasks)
+        RING GroupRing;
+        // Pending UNIX signal (protected by EventLoop->Lock)
+        siginfo_t* UnixSignal;
+        // Next task in wake queue (headed by EventLoop->WakeQueue)
+        struct _LW_TASK* NextWake;
+        // Ref count
+        LONG volatile RefCount;
+        // Events posted by external wakers
+        LONG volatile EventSignal;
+    } LW_CACHE_ALIGNED;
+};
+
+typedef struct _RING
+{
+    struct _RING* pPrev;
+    struct _RING* pNext;
+} RING, *PRING;
+
+#define LW_STRUCT_FROM_FIELD(Pointer, Type, Field) \
+    ((Type*)LwRtlOffsetToPointer(Pointer, -((ssize_t)LW_FIELD_OFFSET(Type, Field))))
+
+typedef struct LW_PAIR_NODE_
+{
+    LW_UINT64 Order;
+    struct LW_PAIR_NODE_* Children;
+    struct LW_PAIR_NODE_* Next;
+} LW_PAIR_NODE;
+
+static inline
+LW_VOID
+LwPairNodeInit(
+    LW_OUT PLW_PAIR_NODE Node
+    )
+{
+    Node->Order = LW_MAXULONG64;
+    Node->Next = NULL;
+    <===================================== Q: no init for Children????????
+}
+
+struct _LW_TASK_GROUP
+{
+    // Rundown promise
+    PLW_PROMISE Rundown;
+    // Pool on which tasks run (might be delegate)
+    PLW_THREAD_POOL Pool;
+    // Pool which actually created the group
+    PLW_THREAD_POOL CreatorPool;
+    // List of tasks (linked by LW_TASK::GroupRing)
+    RING Tasks;
+    // Event loop affinity
+    LONG Affinity;
+    // Atomic integer used for round-robin event loop assignment
+    LONG RoundRobin;
+    // Lock and condition variable protecting Tasks and IsCancelled
+    pthread_mutex_t Lock;
+    BOOLEAN LockInit:1;
+    pthread_cond_t Event;
+    BOOLEAN EventInit:1;
+    // Is task group cancelled?
+    BOOLEAN IsCancelled:1;
+};
+
+
+static
+NTSTATUS
+RunTask(
+    PLW_TASK pTask,
+    LONG64 llNow
+    )
+
+
+typedef
+LW_VOID
+(*LW_TASK_FUNCTION)(
+    LW_IN PLW_TASK pTask,
+    LW_IN LW_PVOID pContext,
+    LW_IN LW_TASK_EVENT_MASK WakeMask,
+    LW_IN LW_OUT LW_TASK_EVENT_MASK* pWaitMask,
+    LW_IN LW_OUT LW_LONG64* pllTime
+    );
+
+
+static
+NTSTATUS
+ProcessRunnable(
+    PEVENT_LOOP Loop,
+    LONG64 llNow
+    )
+{
+
+static inline
+VOID
+RingMove(
+    PRING pFrom,
+    PRING pTo
+    )
+{
+    PRING pFromFirst = pFrom->pNext;
+    PRING pFromLast = pFrom->pPrev;
+    PRING pToLast = pTo->pPrev;
+
+    if (pFrom->pNext != pFrom)
+    {
+        pToLast->pNext = pFromFirst;
+        pFromFirst->pPrev = pToLast;
+        
+        pFromLast->pNext = pTo;
+        pTo->pPrev = pFromLast;
+        
+        pFrom->pNext = pFrom->pPrev = pFrom;
+    }
+}
+
+LwRtlTaskBeginBlock
+
+SpawnEventThread
+
+LW_NTSTATUS
+LwThreadPoolCreate(
+    LW_IN LW_OPTIONAL PLW_THREAD_POOL_ATTRIBUTES Attrs,
+    LW_OUT PLW_THREAD_POOL* Pool,
+    LW_OUT PLW_PROMISE* Rundown
+    )
+
+struct _LW_THREAD_POOL_ATTRIBUTES
+{
+    unsigned bDelegateTasks:1;
+    unsigned Scalable:1;
+    LONG EventLoops;
+    ULONG BlockQuota;
+    LONG lWorkThreads;
+    ULONG ulTaskThreadStackSize;
+    ULONG ulWorkThreadStackSize;
+    ULONG ulWorkThreadTimeout;
+    ULONG SparkStackSize;
+    ULONG MaxSparkTasks;
+    LW_CHAR ThreadPoolName[THREAD_POOL_NAME_BUF_SIZE];
+};
+
+struct _LW_THREAD_POOL
+{
+    LW_REF_CONTROL_BLOCK Ref;
+    // If set, pool to which we delegate tasks and task groups
+    struct _LW_THREAD_POOL* Delegate;
+    // Default task group used if one is not specific to create a task
+    PLW_TASK_GROUP DefaultGroup;
+    // Array of event loops of length EventLoopCount.
+    // This is NULL/0 when delegating
+    PEVENT_LOOP EventLoops;
+    ULONG EventLoopCount;
+    // Array of buckets for tracking quotas of blocking threads
+    PBLOCK_BUCKET BlockBuckets;
+    // Number of buckets
+    ULONG BlockBucketCount;
+    pthread_mutex_t Lock;
+    // Worker threads (see threadpool-common.c)
+    LW_WORK_THREADS WorkThreads;
+    // Sparks (see threadpool-spark.c)
+    LW_SPARK_POOL Sparks;
+    // Deferral key used by sparks
+    PLW_DEFER_KEY SparkKey;
+    // Rundown group used for most things
+    PLW_PROMISE_GROUP RundownGroup;
+    // Internal rundown promise
+    PLW_PROMISE InternalRundown;
+    // External rundown promise
+    PLW_PROMISE ExternalRundown;
+    // Allocated using legacy function?
+    BOOLEAN IsLegacy;
+    // Attributes from initialization
+    LW_THREAD_POOL_ATTRIBUTES Attrs;
+};
